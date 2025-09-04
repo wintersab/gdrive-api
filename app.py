@@ -5,6 +5,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from functools import wraps
 from datetime import datetime
 import io, os, mimetypes
+import base64
 
 app = Flask(__name__)
 
@@ -41,6 +42,39 @@ mimetypes.init()
 
 
 # ======= Helpers =======
+def _extract_api_key_from_headers():
+    # 1) Custom header
+    key = request.headers.get('X-API-Key')
+    if key:
+        return key
+
+    # 2) Authorization: Bearer <key>
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        return auth.split(' ', 1)[1].strip()
+
+    # 3) Authorization: Basic base64(key:) or base64(key)
+    if auth.startswith('Basic '):
+        try:
+            raw = base64.b64decode(auth.split(' ', 1)[1]).decode('utf-8')
+            # allow "key" or "key:anything"
+            return raw.split(':', 1)[0].strip()
+        except Exception:
+            return None
+    return None
+
+# --- modify your require_api_key decorator to use it ---
+def require_api_key(write=False):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            provided = _extract_api_key_from_headers()
+            if not API_KEY or provided != API_KEY:
+                return jsonify({'error': 'unauthorized'}), 401
+            # ... (leave your write guardrails exactly as-is) ...
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 def require_api_key(write=False):
     def decorator(fn):
         @wraps(fn)
