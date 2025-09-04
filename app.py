@@ -33,6 +33,13 @@ def get_file_content(file_id):
         status, done = downloader.next_chunk()
     fh.seek(0)
     return send_file(fh, as_attachment=False, download_name="file")
+@app.route('/', methods=['GET'])
+def index():
+    return "GDrive SSOT API is running. Try /files", 200
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    return {"status": "ok"}, 200
 
 # Later: add upload or update endpoints here
 
