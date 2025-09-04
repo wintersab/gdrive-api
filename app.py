@@ -1,12 +1,12 @@
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, send_file, request, abort
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import io
 
 app = Flask(__name__)
 
-# ✅ Your new SSOT folder (Shared drive)
+# ✅ Your SSOT folder (Shared drive)
 FOLDER_ID = '1Ox7DXcd9AEvF84FkCVyB90MGHR0v7q7R'
 
 # Google Drive API setup
@@ -29,18 +29,17 @@ def healthz():
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
 
+# ---- READ: list & download ----------------------------------------------------
+
 @app.route('/files', methods=['GET'])
 def list_files():
-    """
-    Lists files directly under the SSOT folder.
-    Includes Shared drive flags so it can see content in Shared drives.
-    """
+    """List direct children of the SSOT folder."""
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents and trashed = false",
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
-            fields="files(id,name,mimeType,parents)"
+            fields="files(id,name,mimeType,parents,modifiedTime,size)"
         ).execute()
         files = results.get('files', [])
         print("DEBUG /files -> count:", len(files))
@@ -51,7 +50,7 @@ def list_files():
 
 @app.route('/files/<file_id>/content', methods=['GET'])
 def get_file_content(file_id):
-    """Downloads file bytes; also supports Shared drives."""
+    """Download file bytes; supports Shared drives."""
     try:
         request_file = drive_service.files().get_media(
             fileId=file_id,
@@ -68,7 +67,94 @@ def get_file_content(file_id):
         print("ERROR /files/<id>/content:", e)
         return jsonify({"error": str(e)}), 500
 
-# Helpful debug: shows if the folder is recognized and has a driveId (Shared drive)
+# ---- WRITE: upload new & update existing -------------------------------------
+
+@app.route('/files', methods=['POST'])
+def upload_file():
+    """
+    Upload a new file into the SSOT folder.
+    Accepts multipart/form-data with:
+      - file: binary file (required)
+      - name: optional override filename
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "missing 'file' field"}), 400
+
+        up = request.files['file']
+        name = request.form.get('name') or (up.filename or 'untitled')
+
+        media = MediaIoBaseUpload(up.stream, mimetype=up.mimetype or 'application/octet-stream', resumable=False)
+        metadata = {'name': name, 'parents': [FOLDER_ID]}
+
+        created = drive_service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id,name,mimeType,parents,modifiedTime,size",
+            supportsAllDrives=True
+        ).execute()
+
+        return jsonify(created), 201
+    except Exception as e:
+        print("ERROR POST /files:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/files/<file_id>', methods=['PATCH'])
+def update_file(file_id):
+    """
+    Replace the contents of an existing file.
+    Accepts multipart/form-data with:
+      - file: binary file (required)
+      - name: optional new name (rename)
+    NOTE: This updates binary files (txt, md, yml, csv, docx). It does NOT
+          convert native Google Docs; for those, upload a new binary or use export.
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "missing 'file' field"}), 400
+
+        up = request.files['file']
+        new_name = request.form.get('name')
+
+        media = MediaIoBaseUpload(up.stream, mimetype=up.mimetype or 'application/octet-stream', resumable=False)
+
+        body = {}
+        if new_name:
+            body['name'] = new_name
+
+        updated = drive_service.files().update(
+            fileId=file_id,
+            body=body if body else None,
+            media_body=media,
+            fields="id,name,mimeType,parents,modifiedTime,size",
+            supportsAllDrives=True
+        ).execute()
+
+        return jsonify(updated), 200
+    except Exception as e:
+        print("ERROR PATCH /files/<id>:", e)
+        return jsonify({"error": str(e)}), 500
+
+# Optional: rename without changing content
+@app.route('/files/<file_id>/metadata', methods=['PATCH'])
+def rename_file(file_id):
+    try:
+        data = request.get_json(silent=True) or {}
+        new_name = data.get('name')
+        if not new_name:
+            return jsonify({"error": "missing 'name' in JSON body"}), 400
+        updated = drive_service.files().update(
+            fileId=file_id,
+            body={'name': new_name},
+            fields="id,name,mimeType,parents,modifiedTime,size",
+            supportsAllDrives=True
+        ).execute()
+        return jsonify(updated), 200
+    except Exception as e:
+        print("ERROR PATCH /files/<id>/metadata:", e)
+        return jsonify({"error": str(e)}), 500
+
+# Helpful: confirm folder meta (should show a driveId if Shared drive)
 @app.route('/debug/folder', methods=['GET'])
 def debug_folder():
     try:
