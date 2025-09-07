@@ -5,12 +5,83 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from functools import wraps
 from datetime import datetime
 import io, os, mimetypes
-import base64
 
 app = Flask(__name__)
 
 # ======= SSOT CONFIG (Folder lives in a Shared drive) =======
 FOLDER_ID = '1Ox7DXcd9AEvF84FkCVyB90MGHR0v7q7R'  # <— your SSOT folder ID
+# ======= SSOT Lifecycle Folders =======
+# Option A: provide explicit folder IDs via env (preferred for production)
+STAGING_FOLDER_ID = os.getenv('1cSk2p-Ds3b8OJHnVxRTMzADNXwGuaYZ8')  # /ssot/staging
+ARCHIVE_FOLDER_ID = os.getenv('1_aS36KiiYb4fWkLGrFM-S8DxiHBLaY5i')  # /ssot/archive
+
+# Option B: auto-resolve (and create if missing) subfolders named 'staging' and 'archive' under FOLDER_ID
+def _ensure_subfolder(parent_id: str, name: str) -> str:
+    q = (
+        f"'{parent_id}' in parents and "
+        f"name = '{name}' and "
+        f"mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    res = drive_service.files().list(
+        q=q, includeItemsFromAllDrives=True, supportsAllDrives=True, fields="files(id,name)"
+    ).execute()
+    if res.get('files'):
+        return res['files'][0]['id']
+    created = drive_service.files().create(
+        body={
+            'name': name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [parent_id]
+        },
+        fields="id",
+        supportsAllDrives=True
+    ).execute()
+    return created['id']
+
+if not STAGING_FOLDER_ID:
+    STAGING_FOLDER_ID = _ensure_subfolder(FOLDER_ID, 'staging')
+if not ARCHIVE_FOLDER_ID:
+    ARCHIVE_FOLDER_ID = _ensure_subfolder(FOLDER_ID, 'archive')
+
+ALLOWED_PARENTS = {FOLDER_ID, STAGING_FOLDER_ID, ARCHIVE_FOLDER_ID}
+
+def _resolve_parents_arg(parents_arg):
+    """
+    Accepts: None | 'ssot'|'staging'|'archive' | folderId | [folderId].
+    Returns: single-item list with a validated parent ID.
+    """
+    if not parents_arg:
+        return [FOLDER_ID]
+    if isinstance(parents_arg, str):
+        key = parents_arg.strip().lower()
+        if key in ('ssot', '/ssot'):
+            return [FOLDER_ID]
+        if key in ('staging', '/ssot/staging'):
+            return [STAGING_FOLDER_ID]
+        if key in ('archive', 'archived', '/ssot/archive'):
+            return [ARCHIVE_FOLDER_ID]
+        # Assume it is a folderId
+        return [parents_arg]
+    if isinstance(parents_arg, list) and parents_arg:
+        return [parents_arg[0]]
+    abort(400, description="invalid 'parents' argument")
+
+def _enforce_allowed_parents(parents: list[str]):
+    if not parents or parents[0] not in ALLOWED_PARENTS:
+        abort(403, description="Parent folder not allowed; must be SSOT, staging, or archive.")
+
+def _ensure_in_folder(file_id: str, folder_id: str, err="File is not in required folder"):
+    meta = drive_service.files().get(
+        fileId=file_id,
+        fields="id,parents",
+        supportsAllDrives=True
+    ).execute()
+    if folder_id not in (meta.get('parents') or []):
+        abort(403, description=err)
+
+def _archive_stamp():
+    # Governance format: <YYYY-MM-DD-HHMM>
+    return datetime.utcnow().strftime('%Y-%m-%d-%H%M')
 
 # ======= Google Drive API =======
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -42,39 +113,6 @@ mimetypes.init()
 
 
 # ======= Helpers =======
-def _extract_api_key_from_headers():
-    # 1) Custom header
-    key = request.headers.get('X-API-Key')
-    if key:
-        return key
-
-    # 2) Authorization: Bearer <key>
-    auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer '):
-        return auth.split(' ', 1)[1].strip()
-
-    # 3) Authorization: Basic base64(key:) or base64(key)
-    if auth.startswith('Basic '):
-        try:
-            raw = base64.b64decode(auth.split(' ', 1)[1]).decode('utf-8')
-            # allow "key" or "key:anything"
-            return raw.split(':', 1)[0].strip()
-        except Exception:
-            return None
-    return None
-
-# --- modify your require_api_key decorator to use it ---
-def require_api_key(write=False):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            provided = _extract_api_key_from_headers()
-            if not API_KEY or provided != API_KEY:
-                return jsonify({'error': 'unauthorized'}), 401
-            # ... (leave your write guardrails exactly as-is) ...
-            return fn(*args, **kwargs)
-        return wrapper
-    return decorator
 def require_api_key(write=False):
     def decorator(fn):
         @wraps(fn)
@@ -145,6 +183,102 @@ def text_upload_media(content: str, mime: str):
 def now_stamp():
     return datetime.utcnow().strftime('%Y%m%d-%H%M%S')
 
+
+def stage_file(source_name: str, media_body):
+    """Create *.proposed.<timestamp> in /ssot/staging/"""
+    ts = now_stamp()
+    proposed_name = f"{source_name}.proposed.{ts}"
+    created = drive_service.files().create(
+        body={'name': proposed_name, 'parents': [STAGING_FOLDER_ID]},
+        media_body=media_body,
+        fields="id,name,mimeType,parents,modifiedTime,size",
+        supportsAllDrives=True
+    ).execute()
+    return created
+
+def archive_file(file_id: str) -> dict:
+    """Copy current authoritative into /ssot/archive/ with timestamped name."""
+    # Must be inside SSOT (authoritative) before archiving
+    _ensure_in_folder(file_id, FOLDER_ID, err="Can only archive items from /ssot")
+    meta = drive_service.files().get(
+        fileId=file_id,
+        fields="id,name,parents",
+        supportsAllDrives=True
+    ).execute()
+    base, ext = os.path.splitext(meta['name'])
+    stamped = f"{base}.{_archive_stamp()}{ext}"
+    archived = drive_service.files().copy(
+        fileId=file_id,
+        body={'name': stamped, 'parents': [ARCHIVE_FOLDER_ID]},
+        supportsAllDrives=True,
+        fields="id,name,parents,modifiedTime,size"
+    ).execute()
+    return archived  # includes new id
+
+def _find_staged_for(meta_name: str) -> dict | None:
+    """Find a staged *.proposed.* file in /ssot/staging that matches the meta_name prefix."""
+    q = (
+        f"'{STAGING_FOLDER_ID}' in parents and trashed = false and "
+        f"mimeType != 'application/vnd.google-apps.folder' and "
+        f"name contains '{meta_name}.proposed.'"
+    )
+    res = drive_service.files().list(
+        q=q, includeItemsFromAllDrives=True, supportsAllDrives=True,
+        fields="files(id,name,modifiedTime,size)"
+    ).execute()
+    files = res.get('files', [])
+    # Return the most recent, if any
+    return max(files, key=lambda f: f.get('modifiedTime', ''), default=None) if files else None
+
+def overwrite_file(file_id: str, media_body, new_name: str | None, staged_id: str | None):
+    """
+    Overwrite authoritative in /ssot with compliance:
+      1) Must have a staged proposal in /ssot/staging (staged_id or discoverable).
+      2) Archive the current authoritative into /ssot/archive first.
+      3) Update the authoritative (exactly one current version in /ssot).
+    Fails with 412 if no staged proposal is found; 500 if archive fails.
+    """
+    # Target must be authoritative
+    _ensure_in_folder(file_id, FOLDER_ID, err="Target is not in /ssot (authoritative)")
+
+    meta = drive_service.files().get(
+        fileId=file_id,
+        fields="id,name,parents,mimeType",
+        supportsAllDrives=True
+    ).execute()
+
+    # Validate staged proposal
+    staged = None
+    if staged_id:
+        # Must live in staging and be a *.proposed.* for this file
+        _ensure_in_folder(staged_id, STAGING_FOLDER_ID, err="stagedId is not in /ssot/staging")
+        s_meta = drive_service.files().get(
+            fileId=staged_id, fields="id,name,parents", supportsAllDrives=True
+        ).execute()
+        if not s_meta['name'].startswith(f"{meta['name']}.proposed."):
+            abort(412, description="stagedId does not match target file name")
+        staged = s_meta
+    else:
+        staged = _find_staged_for(meta['name'])
+        if not staged:
+            abort(412, description="No staged proposal found in /ssot/staging for this file")
+
+    # Archive current authoritative
+    archived = archive_file(file_id)
+    if not archived or not archived.get('id'):
+        abort(500, description="Archiving failed; aborting overwrite")
+
+    # Perform overwrite (optionally rename)
+    body = {'name': new_name} if new_name else None
+    updated = drive_service.files().update(
+        fileId=file_id,
+        body=body,
+        media_body=media_body,
+        fields="id,name,mimeType,parents,modifiedTime,size",
+        supportsAllDrives=True
+    ).execute()
+
+    return {"updated": updated, "archived": archived, "usedStaged": staged}
 
 # ======= Routes =======
 @app.route('/', methods=['GET'])
@@ -227,10 +361,11 @@ def get_file_text(file_id):
 @require_api_key(write=True)
 def upload_file():
     """
-    Upload a new file into the SSOT folder.
+    Upload a new file.
     multipart/form-data:
       - file (binary, required)
       - name (optional)
+      - parents (optional; 'ssot'|'staging'|'archive' or folderId)
       - confirm (required via guard)
     """
     try:
@@ -241,13 +376,17 @@ def upload_file():
         if not allowed_name_and_mime(name, up.mimetype):
             return jsonify({"error": "file type not allowed"}), 415
 
+        parents_arg = request.form.get('parents')
+        parents = _resolve_parents_arg(parents_arg)
+        _enforce_allowed_parents(parents)
+
         media = MediaIoBaseUpload(
             up.stream,
             mimetype=(up.mimetype or guess_mime_from_name(name)),
             resumable=False
         )
         created = drive_service.files().create(
-            body={'name': name, 'parents': [FOLDER_ID]},
+            body={'name': name, 'parents': parents},
             media_body=media,
             fields="id,name,mimeType,parents,modifiedTime,size",
             supportsAllDrives=True
@@ -266,18 +405,22 @@ def update_file(file_id):
     multipart/form-data:
       - file (binary, required)
       - name (optional rename; must be allowed)
+      - mode (optional; 'staging'|'overwrite') — defaults to WRITE_MODE if omitted
+      - stagedId (optional; required for overwrite compliance if auto-discovery fails)
       - confirm (required via guard)
-    WRITE_MODE:
-      - 'staging': creates a .proposed.TIMESTAMP copy (original untouched)
-      - 'overwrite': creates a .backup.TIMESTAMP, then updates original
+    Lifecycle rules:
+      - staging: write *.proposed.<ts> into /ssot/staging
+      - overwrite: require a staged proposal and archive current authoritative first, then update file in /ssot
     """
     try:
-        ensure_in_ssot(file_id)
+        ensure_in_ssot(file_id)  # Target must be inside /ssot (authoritative)
 
         if 'file' not in request.files:
             return jsonify({"error": "missing 'file'"}), 400
         up = request.files['file']
         new_name = request.form.get('name')
+        mode = (request.form.get('mode') or WRITE_MODE).lower()
+        staged_id = request.form.get('stagedId')
 
         # Current meta
         meta = drive_service.files().get(
@@ -292,38 +435,15 @@ def update_file(file_id):
         if not allowed_name_and_mime(target_name, target_mime):
             return jsonify({"error": "file type not allowed"}), 415
 
-        ts = now_stamp()
+        media = MediaIoBaseUpload(up.stream, mimetype=target_mime, resumable=False)
 
-        if WRITE_MODE == 'staging':
-            proposed_name = f"{meta['name']}.proposed.{ts}"
-            media = MediaIoBaseUpload(up.stream, mimetype=target_mime, resumable=False)
-            created = drive_service.files().create(
-                body={'name': proposed_name, 'parents': meta.get('parents', [FOLDER_ID])},
-                media_body=media,
-                fields="id,name,mimeType,parents,modifiedTime,size",
-                supportsAllDrives=True
-            ).execute()
+        if mode == 'staging':
+            created = stage_file(meta['name'], media)
             return jsonify({"mode": "staging", "created": created, "sourceId": file_id}), 201
 
-        # overwrite: backup then update
-        backup_name = f"{meta['name']}.backup.{ts}"
-        drive_service.files().copy(
-            fileId=file_id,
-            body={'name': backup_name, 'parents': meta.get('parents', [FOLDER_ID])},
-            supportsAllDrives=True,
-            fields="id"
-        ).execute()
-
-        media = MediaIoBaseUpload(up.stream, mimetype=target_mime, resumable=False)
-        body = {'name': new_name} if new_name else None
-        updated = drive_service.files().update(
-            fileId=file_id,
-            body=body,
-            media_body=media,
-            fields="id,name,mimeType,parents,modifiedTime,size",
-            supportsAllDrives=True
-        ).execute()
-        return jsonify({"mode": "overwrite", "updated": updated, "backupOf": backup_name}), 200
+        # overwrite mode with compliance enforcement
+        result = overwrite_file(file_id, media, new_name, staged_id)
+        return jsonify({"mode": "overwrite", **result}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -339,6 +459,7 @@ def create_text_file():
       - name (required)
       - content (required)
       - mimeType (optional; default text/plain)
+      - parents (optional; 'ssot'|'staging'|'archive' or folderId)
       - confirm (required via guard)
     """
     try:
@@ -346,6 +467,7 @@ def create_text_file():
         name = data.get('name')
         content = data.get('content')
         mime = data.get('mimeType') or 'text/plain'
+        parents_arg = data.get('parents')
         if not name or content is None:
             return jsonify({"error": "missing 'name' or 'content'"}), 400
         if not allowed_name_and_mime(name, mime):
@@ -353,9 +475,12 @@ def create_text_file():
         if len(content.encode('utf-8')) > MAX_BYTES:
             return jsonify({"error": "content exceeds MAX_BYTES"}), 413
 
+        parents = _resolve_parents_arg(parents_arg)
+        _enforce_allowed_parents(parents)
+
         media = text_upload_media(content, mime)
         created = drive_service.files().create(
-            body={'name': name, 'parents': [FOLDER_ID]},
+            body={'name': name, 'parents': parents},
             media_body=media,
             fields="id,name,mimeType,parents,modifiedTime,size",
             supportsAllDrives=True
@@ -363,7 +488,6 @@ def create_text_file():
         return jsonify(created), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 # ---- UPDATE (Text JSON) ----
 @app.route('/files/<file_id>/text', methods=['PATCH'])
@@ -374,9 +498,10 @@ def update_text_file(file_id):
     JSON body:
       - content (required)
       - mimeType (optional; default text/plain)
-      - name (optional rename; must be allowed; only applied in overwrite mode)
+      - name (optional rename; must be allowed; applied only at overwrite)
+      - mode (optional; 'staging'|'overwrite') — defaults to WRITE_MODE if omitted
+      - stagedId (optional; required for overwrite compliance if auto-discovery fails)
       - confirm (required via guard)
-    Honors WRITE_MODE (staging/overwrite) with backups.
     """
     try:
         ensure_in_ssot(file_id)
@@ -385,6 +510,9 @@ def update_text_file(file_id):
         content = data.get('content')
         mime = data.get('mimeType') or 'text/plain'
         new_name = data.get('name')
+        mode = (data.get('mode') or WRITE_MODE).lower()
+        staged_id = data.get('stagedId')
+
         if content is None:
             return jsonify({"error": "missing 'content'"}), 400
         if len(content.encode('utf-8')) > MAX_BYTES:
@@ -400,38 +528,15 @@ def update_text_file(file_id):
         if not allowed_name_and_mime(target_name, mime):
             return jsonify({"error": "file type not allowed"}), 415
 
-        ts = now_stamp()
+        media = text_upload_media(content, mime)
 
-        if WRITE_MODE == 'staging':
-            proposed_name = f"{meta['name']}.proposed.{ts}"
-            media = text_upload_media(content, mime)
-            created = drive_service.files().create(
-                body={'name': proposed_name, 'parents': meta.get('parents', [FOLDER_ID])},
-                media_body=media,
-                fields="id,name,mimeType,parents,modifiedTime,size",
-                supportsAllDrives=True
-            ).execute()
+        if mode == 'staging':
+            created = stage_file(meta['name'], media)
             return jsonify({"mode": "staging", "created": created, "sourceId": file_id}), 201
 
-        # overwrite
-        backup_name = f"{meta['name']}.backup.{ts}"
-        drive_service.files().copy(
-            fileId=file_id,
-            body={'name': backup_name, 'parents': meta.get('parents', [FOLDER_ID])},
-            supportsAllDrives=True,
-            fields="id"
-        ).execute()
-
-        body = {'name': new_name} if new_name else None
-        media = text_upload_media(content, mime)
-        updated = drive_service.files().update(
-            fileId=file_id,
-            body=body,
-            media_body=media,
-            fields="id,name,mimeType,parents,modifiedTime,size",
-            supportsAllDrives=True
-        ).execute()
-        return jsonify({"mode": "overwrite", "updated": updated, "backupOf": backup_name}), 200
+        # overwrite mode with compliance enforcement
+        result = overwrite_file(file_id, media, new_name, staged_id)
+        return jsonify({"mode": "overwrite", **result}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -458,6 +563,30 @@ def rename_file(file_id):
             supportsAllDrives=True
         ).execute()
         return jsonify(updated), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---- STAGING CLEANUP (dangerous; scoped to /ssot/staging only) ----
+@app.route('/staging/cleanup', methods=['POST'])
+@require_api_key(write=True)
+def cleanup_staging():
+    """
+    Deletes ALL files inside /ssot/staging (not folders), leaving /ssot and /ssot/archive untouched.
+    Requires the same confirmation phrase via @require_api_key(write=True).
+    """
+    try:
+        # List non-folder files in STAGING and delete one by one
+        q = (
+            f"'{STAGING_FOLDER_ID}' in parents and trashed = false and "
+            f"mimeType != 'application/vnd.google-apps.folder'"
+        )
+        res = drive_service.files().list(
+            q=q, includeItemsFromAllDrives=True, supportsAllDrives=True, fields="files(id,name)"
+        ).execute()
+        files = res.get('files', [])
+        for f in files:
+            drive_service.files().delete(fileId=f['id']).execute()
+        return jsonify({"deleted": len(files)}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
