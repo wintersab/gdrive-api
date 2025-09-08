@@ -9,7 +9,7 @@ import io, os, mimetypes
 app = Flask(__name__)
 
 # ======= SSOT CONFIG (Folder lives in a Shared drive) =======
-# Keep your known-good SSOT folder ID to avoid FOLDER_ID env mishaps.
+# Keep your known-good SSOT folder ID to avoid env mishaps.
 FOLDER_ID = '1Ox7DXcd9AEvF84FkCVyB90MGHR0v7q7R'  # /ssot (authoritative)
 
 # ======= Google Drive API =======
@@ -171,7 +171,17 @@ def _archive_stamp():
     # <YYYY-MM-DD-HHMM> for governance naming in /ssot/archive
     return datetime.utcnow().strftime('%Y-%m-%d-%H%M')
 
-# ======= Lifecycle helpers: stage → archive → overwrite =======
+def _download_bytes(file_id: str) -> bytes:
+    """Download a Drive file's bytes (full content fidelity)."""
+    req = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+# ======= Lifecycle helpers: stage → archive → overwrite/promote =======
 def stage_file(source_name: str, media_body):
     """Create *.proposed.<timestamp> in /ssot/staging/"""
     proposed_name = f"{source_name}.proposed.{now_stamp()}"
@@ -197,6 +207,7 @@ def archive_file(file_id: str) -> dict:
         supportsAllDrives=True,
         fields="id,name,parents,modifiedTime,size"
     ).execute()
+    app.logger.info(f"[archive] {meta['name']} -> /archive as {stamped} ({archived.get('id')})")
     return archived
 
 def _find_staged_for(meta_name: str):
@@ -217,38 +228,19 @@ def _find_staged_for(meta_name: str):
 
 def overwrite_file(file_id: str, media_body, new_name: str = None, staged_id: str = None):
     """
-    Overwrite authoritative in /ssot with compliance:
-      1) Must have a staged proposal in /ssot/staging (stagedId or auto-discovered).
-      2) Archive the current authoritative into /ssot/archive first.
-      3) Update the authoritative (exactly one current version remains in /ssot).
+    Back-compat path: archive current, then overwrite authoritative with provided media bytes.
+    If staged_id is given, just ensure it's in /ssot/staging (filename no longer required to match).
     """
     _ensure_in_folder(file_id, FOLDER_ID, err="Target is not in /ssot (authoritative)")
-
-    meta = drive_service.files().get(
-        fileId=file_id, fields="id,name,parents,mimeType", supportsAllDrives=True
-    ).execute()
-
-    # Validate staged proposal
-    staged = None
     if staged_id:
         _ensure_in_folder(staged_id, STAGING_FOLDER_ID, err="stagedId is not in /ssot/staging")
-        s_meta = drive_service.files().get(
-            fileId=staged_id, fields="id,name,parents", supportsAllDrives=True
-        ).execute()
-        if not s_meta['name'].startswith(f"{meta['name']}.proposed."):
-            abort(412, description="stagedId does not match target file name")
-        staged = s_meta
-    else:
-        staged = _find_staged_for(meta['name'])
-        if not staged:
-            abort(412, description="No staged proposal found in /ssot/staging for this file")
 
-    # 2) Archive current authoritative
+    # Explicit archive
     archived = archive_file(file_id)
     if not archived or not archived.get('id'):
         abort(500, description="Archiving failed; aborting overwrite")
 
-    # 3) Overwrite authoritative (optionally rename)
+    # Overwrite (optionally rename)
     body = {'name': new_name} if new_name else None
     updated = drive_service.files().update(
         fileId=file_id,
@@ -258,7 +250,55 @@ def overwrite_file(file_id: str, media_body, new_name: str = None, staged_id: st
         supportsAllDrives=True
     ).execute()
 
-    return {"updated": updated, "archived": archived, "usedStaged": staged}
+    app.logger.info(f"[overwrite] updated {updated.get('name')} ({updated.get('id')}); archived {archived.get('name')}")
+    return {"updated": updated, "archived": archived}
+
+def promote_staged_to_authoritative(authoritative_id: str, staged_id: str) -> dict:
+    """
+    New explicit, verifiable workflow:
+      1) Archive the current authoritative file to /ssot/archive with timestamped name.
+      2) Promote staged content into authoritative by replacing its bytes (ID and name preserved).
+      3) Keep the staged file in /ssot/staging (for audit) — no deletes/moves.
+    Returns structured metadata for archived, staged, and updated authoritative.
+    """
+    # Folder checks
+    _ensure_in_folder(authoritative_id, FOLDER_ID, err="authoritativeId must be inside /ssot")
+    _ensure_in_folder(staged_id, STAGING_FOLDER_ID, err="stagedId must be inside /ssot/staging")
+
+    # Get metas (for names)
+    auth_meta = drive_service.files().get(
+        fileId=authoritative_id, fields="id,name,parents,mimeType,modifiedTime,size", supportsAllDrives=True
+    ).execute()
+    staged_meta = drive_service.files().get(
+        fileId=staged_id, fields="id,name,parents,mimeType,modifiedTime,size", supportsAllDrives=True
+    ).execute()
+
+    # 1) Archive authoritative
+    archived = archive_file(authoritative_id)
+
+    # 2) Download staged bytes (full fidelity) and write to authoritative
+    staged_bytes = _download_bytes(staged_id)
+    media = MediaIoBaseUpload(io.BytesIO(staged_bytes), mimetype=staged_meta.get('mimeType') or 'application/octet-stream', resumable=False)
+
+    updated = drive_service.files().update(
+        fileId=authoritative_id,
+        body=None,  # keep same name
+        media_body=media,
+        fields="id,name,mimeType,parents,modifiedTime,size",
+        supportsAllDrives=True
+    ).execute()
+
+    # Log clear action transcript
+    app.logger.info(f"[promote] archived {auth_meta.get('name')} -> {archived.get('name')}; "
+                    f"promoted content from staged {staged_meta.get('name')} into {updated.get('name')}")
+
+    return {
+        "actions": ["archived", "promoted", "finalized"],
+        "authoritativeBefore": auth_meta,
+        "archived": archived,
+        "staged": staged_meta,
+        "authoritativeAfter": updated
+    }
 
 # ======= Routes =======
 @app.route('/', methods=['GET'])
@@ -379,11 +419,10 @@ def update_file(file_id):
       - name (optional rename; must be allowed)
       - mode (optional; 'staging' or 'overwrite') — defaults to WRITE_MODE
       - stagedId (optional; used for overwrite compliance if you want to bind a specific staged file)
-      - parents (ignored; lifecycle enforces correct folders)
       - confirm (required via guard)
     Lifecycle rules:
       - staging: write *.proposed.<ts> into /ssot/staging
-      - overwrite: require staged proposal; archive current to /ssot/archive; then update /ssot
+      - overwrite: archive current to /ssot/archive; then update /ssot (no filename coupling)
     """
     try:
         ensure_in_ssot(file_id)  # Target must be inside /ssot
@@ -410,7 +449,7 @@ def update_file(file_id):
             created = stage_file(meta['name'], media)
             return jsonify({"mode": "staging", "created": created, "sourceId": file_id}), 201
 
-        # overwrite with compliance
+        # overwrite with explicit archive
         result = overwrite_file(file_id, media, new_name, staged_id)
         return jsonify({"mode": "overwrite", **result}), 200
 
@@ -470,7 +509,6 @@ def update_text_file(file_id):
       - mode (optional; 'staging'|'overwrite') — defaults to WRITE_MODE
       - stagedId (optional; used for overwrite compliance if binding to a specific staged item)
       - confirm (required via guard)
-      - parents (ignored; lifecycle enforces correct folders)
     """
     try:
         ensure_in_ssot(file_id)
@@ -551,6 +589,30 @@ def cleanup_staging():
         for f in files:
             drive_service.files().delete(fileId=f['id']).execute()
         return jsonify({"deleted": len(files)}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---- PROMOTE (explicit archive → promote) ----
+@app.route('/promote', methods=['POST'])
+@require_api_key(write=True)
+def promote():
+    """
+    Promote a staged SSOT file into authoritative with explicit archival.
+    JSON body:
+      - authoritativeId (required): fileId of the authoritative file in /ssot
+      - stagedId (required): fileId of the staged file in /ssot/staging
+      - confirm (required via guard)
+    Returns: structured metadata (archived, staged, authoritativeBefore/After, actions)
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        authoritative_id = data.get('authoritativeId')
+        staged_id = data.get('stagedId')
+        if not authoritative_id or not staged_id:
+            return jsonify({"error": "missing 'authoritativeId' or 'stagedId'"}), 400
+
+        result = promote_staged_to_authoritative(authoritative_id, staged_id)
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
