@@ -108,24 +108,23 @@ def _download_bytes(file_id: str) -> bytes:
 def _md5_hex(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
-# ======= Param normalization (fix for parents query regression) =======
+# ======= Param normalization (fix for parents regression) =======
 def _coerce_parents_param(param):
     """
     Accepts:
       - None
       - 'ssot' | 'staging' | 'archive' | <folderId>
-      - ['ssot'] | ['<folderId>'] (true array)
-      - '["ssot"]' | '["<folderId>"]' (JSON array encoded as string)
-      - Repeated query params (?parents=ssot&parents=staging) -> first wins
+      - ['ssot'] (true array)
+      - '["ssot"]' (JSON array encoded as string)
+      - repeated query (?parents=ssot&parents=staging) -> first wins
     Returns a string or list[str] suitable for _resolve_parents_arg.
     """
     if param is None:
         return None
-    # If Flask gave us a list from getlist(...)
+    # Already a list (from getlist or JSON)
     if isinstance(param, list):
         if not param:
             return None
-        # If first element itself is a JSON array in a string, parse it
         first = param[0]
         if isinstance(first, str):
             s = first.strip()
@@ -136,8 +135,8 @@ def _coerce_parents_param(param):
                         return arr
                 except Exception:
                     pass
-        return param  # already a list (use first element downstream)
-    # If Flask gave us a single string
+        return param
+    # A single string (possibly JSON array-as-string)
     if isinstance(param, str):
         s = param.strip()
         if s.startswith('[') and s.endswith(']'):
@@ -148,17 +147,12 @@ def _coerce_parents_param(param):
             except Exception:
                 pass
         return s
-    # Fallback: leave as-is
     return param
 
 # ======= Parent resolution & folder guards =======
 def _resolve_parents_arg(parents_arg):
     """
-    Accepts:
-      - None
-      - 'ssot' | 'staging' | 'archive'
-      - folderId
-      - ['ssot'|'staging'|'archive'] or [folderId]
+    Accepts None, alias, folderId, or [alias]/[folderId].
     Returns: [<validated folderId>]
     """
     def _map_token(token):
@@ -284,7 +278,6 @@ def _archive_stamp():
     return datetime.utcnow().strftime('%Y-%m-%d-%H%M')
 
 def stage_file(source_name: str, media_body):
-    """Create *.proposed.<timestamp> in /ssot/staging/"""
     proposed_name = f"{source_name}.proposed.{now_stamp()}"
     created = drive_service.files().create(
         body={'name': proposed_name, 'parents': [STAGING_FOLDER_ID]},
@@ -295,7 +288,6 @@ def stage_file(source_name: str, media_body):
     return created
 
 def archive_file(file_id: str) -> dict:
-    """Copy current authoritative into /ssot/archive/ with <name>.<YYYY-MM-DD-HHMM>.<ext>"""
     _ensure_in_folder(file_id, FOLDER_ID, err="Can only archive items from /ssot")
     meta = drive_service.files().get(
         fileId=file_id, fields="id,name,parents", supportsAllDrives=True
@@ -337,12 +329,6 @@ def _update_bytes_with_mime(file_id: str, content_bytes: bytes, name_for_mime: s
     return updated
 
 def overwrite_file(file_id: str, content_bytes: bytes, target_name: str, prefer_mime=None, staged_id=None):
-    """
-    Enforce compliance:
-      - must have an existing staged proposal (*.proposed.* in /ssot/staging) matching target name
-      - archive current authoritative to /ssot/archive
-      - update authoritative bytes with canonical MIME for target_name
-    """
     _ensure_in_folder(file_id, FOLDER_ID, err="Target is not in /ssot (authoritative)")
 
     staged_meta = None
@@ -366,14 +352,6 @@ def overwrite_file(file_id: str, content_bytes: bytes, target_name: str, prefer_
     return {"updated": updated, "archived": archived, "usedStaged": staged_meta}
 
 def promote_staged_to_authoritative(authoritative_id: str, staged_id: str) -> dict:
-    """
-    Promote by BYTES (not pointer):
-      1) Download staged bytes
-      2) Validate staged is a complete document
-      3) Archive current authoritative
-      4) Update authoritative bytes with canonical MIME for authoritative NAME
-      5) Verify checksum + MIME; retry once with canonical MIME if mismatch
-    """
     _ensure_in_folder(authoritative_id, FOLDER_ID, err="authoritativeId must be inside /ssot")
     _ensure_in_folder(staged_id, STAGING_FOLDER_ID, err="stagedId must be inside /ssot/staging")
 
@@ -463,36 +441,58 @@ def healthz():
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
 
-# ---- LIST (alias-aware; robust param normalization) ----
+# ---- LIST (alias-aware; robust param normalization + Shared Drive safe) ----
 @app.route('/files', methods=['GET'])
 @require_api_key(write=False)
 def list_files():
     """
     List direct children of a folder.
-    Query:
+    Query/body (both supported for robustness):
       - parents (optional): "ssot" | "staging" | "archive" | <folderId>
-        Also accepts JSON array string '["ssot"]' or repeated params; defaults to /ssot.
+        Also accepts JSON array string '["ssot"]' or single-item array; defaults to /ssot.
     """
     try:
-        raw_param = request.args.getlist('parents')
-        raw_param = raw_param if raw_param else request.args.get('parents')
-        parents_arg = _coerce_parents_param(raw_param)  # <-- fix: normalize all representations
+        # Accept parents from query OR JSON body (some clients send JSON on GET)
+        raw_q = request.args.getlist('parents') or request.args.get('parents')
+        raw_body = (request.get_json(silent=True) or {}).get('parents') if request.is_json else None
+        raw_param = raw_q if raw_q else raw_body
+
+        parents_arg = _coerce_parents_param(raw_param)
         folder_id = _resolve_parents_arg(parents_arg)[0] if parents_arg else FOLDER_ID
 
-        drive_id = _get_drive_id(folder_id)
         q = f"'{folder_id}' in parents and trashed=false"
-        results = drive_service.files().list(
-            q=q,
-            corpora="drive" if drive_id else "allDrives",
-            driveId=drive_id,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            fields="files(id,name,mimeType,parents,modifiedTime,size,md5Checksum)"
-        ).execute()
-        return jsonify(results.get('files', [])), 200
+        fields = "files(id,name,mimeType,parents,modifiedTime,size,md5Checksum)"
+
+        # Try Shared Drive-scoped query first; if Drive rejects, retry w/ fallback.
+        files = []
+        drive_id = _get_drive_id(folder_id)
+        try:
+            params = dict(
+                q=q,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields=fields
+            )
+            if drive_id:
+                params.update(corpora="drive", driveId=drive_id)
+            else:
+                params.update(corpora="allDrives")
+            files = drive_service.files().list(**params).execute().get('files', [])
+        except Exception:
+            # Fallback: no corpora/driveId (Google sometimes complains on odd combos)
+            files = drive_service.files().list(
+                q=q,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields=fields
+            ).execute().get('files', [])
+
+        return jsonify(files), 200
     except Exception as e:
-        # Make it explicit for debugging callers
-        return jsonify({"error": str(e), "hint": "Check parents param format: use ssot|staging|archive or a folderId, or JSON array like [\"ssot\"]"}), 500
+        return jsonify({
+            "error": str(e),
+            "hint": "Use parents=ssot|staging|archive or a folderId. Also accepted: ['ssot'] or '[\"ssot\"]'."
+        }), 500
 
 # ---- READ: bytes + text ----
 @app.route('/files/<file_id>/content', methods=['GET'])
@@ -532,10 +532,6 @@ def get_file_text(file_id):
 @app.route('/files', methods=['POST'])
 @require_api_key(write=True)
 def upload_file():
-    """
-    Upload a new file into /ssot, /ssot/staging, or /ssot/archive.
-    If staging, enforce full-document policy + canonical MIME.
-    """
     try:
         if 'file' not in request.files:
             return jsonify({"error": "missing 'file'"}), 400
@@ -572,11 +568,6 @@ def upload_file():
 @app.route('/files/<file_id>', methods=['PATCH'])
 @require_api_key(write=True)
 def update_file(file_id):
-    """
-    Replace contents of an existing authoritative file (binary).
-    - staging: write *.proposed.<ts> into /ssot/staging (full doc + canonical MIME)
-    - overwrite: require staged proposal, archive, then update authoritative (canonical MIME for authoritative name)
-    """
     try:
         ensure_in_ssot(file_id)
 
@@ -606,7 +597,6 @@ def update_file(file_id):
             created = stage_file(meta['name'], media)
             return jsonify({"mode": "staging", "created": created, "sourceId": file_id}), 201
 
-        # overwrite
         result = overwrite_file(file_id, raw, target_name, mime, staged_id)
         return jsonify({"mode": "overwrite", **result}), 200
 
@@ -617,10 +607,6 @@ def update_file(file_id):
 @app.route('/files/text', methods=['POST'])
 @require_api_key(write=True)
 def create_text_file():
-    """
-    Create a new text-like file from JSON.
-    If staging, enforce full-document policy + canonical MIME.
-    """
     try:
         data = request.get_json(silent=True) or {}
         name = data.get('name')
@@ -657,11 +643,6 @@ def create_text_file():
 @app.route('/files/<file_id>/text', methods=['PATCH'])
 @require_api_key(write=True)
 def update_text_file(file_id):
-    """
-    Update an existing authoritative file from JSON text content.
-    - staging: full document + canonical MIME (creates *.proposed.<ts> in /ssot/staging)
-    - overwrite: require staged proposal, archive, then update authoritative (canonical MIME)
-    """
     try:
         ensure_in_ssot(file_id)
 
@@ -725,9 +706,6 @@ def rename_file(file_id):
 @app.route('/staging/cleanup', methods=['POST'])
 @require_api_key(write=True)
 def cleanup_staging():
-    """
-    Deletes ALL files inside /ssot/staging (not folders). Leaves /ssot and /ssot/archive untouched.
-    """
     try:
         q = (
             f"'{STAGING_FOLDER_ID}' in parents and trashed = false and "
@@ -747,11 +725,6 @@ def cleanup_staging():
 @app.route('/promote', methods=['POST'])
 @require_api_key(write=True)
 def promote():
-    """
-    Promote a staged SSOT file into authoritative with explicit archival.
-    Promotes by BYTES (not pointer), enforces canonical MIME for authoritative name,
-    verifies checksum + MIME (auto-retry once if needed).
-    """
     try:
         data = request.get_json(silent=True) or {}
         authoritative_id = data.get('authoritativeId')
