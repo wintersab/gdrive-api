@@ -108,6 +108,59 @@ def _download_bytes(file_id: str) -> bytes:
 def _md5_hex(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
+def _strip_outer_quotes(s: str) -> str:
+    if not isinstance(s, str) or len(s) < 2:
+        return s
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        return s[1:-1]
+    return s
+
+def _extract_parents_from_request():
+    """
+    Returns a single token: alias (ssot/staging/archive) or folderId,
+    normalized from query or body, in any common shape.
+    """
+    # 1) Query first (covers ?parents=ssot, repeated, JSON-in-string, etc.)
+    raw = request.args.getlist('parents') or request.args.get('parents')
+    if not raw:
+        # 2) Some runtimes send JSON bodies on GET; try both Flask and manual parse
+        body = None
+        try:
+            body = request.get_json(silent=True)
+        except Exception:
+            body = None
+        if body is None and request.data:
+            try:
+                body = json.loads(request.data.decode('utf-8'))
+            except Exception:
+                body = None
+        if isinstance(body, dict) and 'parents' in body:
+            raw = body['parents']
+
+    # 3) Accept dict shapes: {"alias":"staging"} or {"id":"<folderId>"}, etc.
+    if isinstance(raw, dict):
+        for key in ('alias', 'value', 'id', 'folderId', 'name'):
+            if raw.get(key):
+                raw = raw[key]
+                break
+
+    # 4) Normalize JSON-array-in-a-string: '["ssot"]'
+    if isinstance(raw, str) and raw.strip().startswith('[') and raw.strip().endswith(']'):
+        try:
+            arr = json.loads(raw)
+            if isinstance(arr, list) and arr:
+                raw = arr
+        except Exception:
+            pass
+
+    # 5) If list, take first; if string, strip outer quotes; else None
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, str):
+        raw = _strip_outer_quotes(raw.strip())
+        return raw or None
+    return raw if isinstance(raw, str) else None
+
 # ======= Param normalization (fix for parents regression) =======
 def _coerce_parents_param(param):
     """
@@ -445,25 +498,14 @@ def healthz():
 @app.route('/files', methods=['GET'])
 @require_api_key(write=False)
 def list_files():
-    """
-    List direct children of a folder.
-    Query/body (both supported for robustness):
-      - parents (optional): "ssot" | "staging" | "archive" | <folderId>
-        Also accepts JSON array string '["ssot"]' or single-item array; defaults to /ssot.
-    """
     try:
-        # Accept parents from query OR JSON body (some clients send JSON on GET)
-        raw_q = request.args.getlist('parents') or request.args.get('parents')
-        raw_body = (request.get_json(silent=True) or {}).get('parents') if request.is_json else None
-        raw_param = raw_q if raw_q else raw_body
-
-        parents_arg = _coerce_parents_param(raw_param)
-        folder_id = _resolve_parents_arg(parents_arg)[0] if parents_arg else FOLDER_ID
+        token = _extract_parents_from_request()  # accepts alias/folderId in any shape
+        folder_id = _resolve_parents_arg(token)[0] if token else FOLDER_ID
 
         q = f"'{folder_id}' in parents and trashed=false"
         fields = "files(id,name,mimeType,parents,modifiedTime,size,md5Checksum)"
 
-        # Try Shared Drive-scoped query first; if Drive rejects, retry w/ fallback.
+        # Try Shared Drive-scoped query first
         files = []
         drive_id = _get_drive_id(folder_id)
         try:
@@ -479,7 +521,7 @@ def list_files():
                 params.update(corpora="allDrives")
             files = drive_service.files().list(**params).execute().get('files', [])
         except Exception:
-            # Fallback: no corpora/driveId (Google sometimes complains on odd combos)
+            # Fallback: drop corpora/driveId if Drive is fussy
             files = drive_service.files().list(
                 q=q,
                 includeItemsFromAllDrives=True,
@@ -491,7 +533,7 @@ def list_files():
     except Exception as e:
         return jsonify({
             "error": str(e),
-            "hint": "Use parents=ssot|staging|archive or a folderId. Also accepted: ['ssot'] or '[\"ssot\"]'."
+            "hint": "parents accepted as ssot|staging|archive or folderId; also [\"ssot\"] or JSON body."
         }), 500
 
 # ---- READ: bytes + text ----
