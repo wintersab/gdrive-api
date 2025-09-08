@@ -4,12 +4,19 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from functools import wraps
 from datetime import datetime
-import io, os, mimetypes
+import io, os, mimetypes, json, re
+
+# Optional YAML validation (best-effort)
+try:
+    import yaml  # PyYAML (optional); if not present, YAML check will degrade gracefully
+    HAVE_YAML = True
+except Exception:
+    HAVE_YAML = False
 
 app = Flask(__name__)
 
 # ======= SSOT CONFIG (Folder lives in a Shared drive) =======
-# Keep your known-good SSOT folder ID to avoid env mishaps.
+# Keep your known-good SSOT folder ID (baseline retained) :contentReference[oaicite:2]{index=2}
 FOLDER_ID = '1Ox7DXcd9AEvF84FkCVyB90MGHR0v7q7R'  # /ssot (authoritative)
 
 # ======= Google Drive API =======
@@ -40,8 +47,7 @@ ALLOWED_MIMES = {
 }
 mimetypes.init()
 
-# ======= Three-folder lifecycle config =======
-# Auto-resolve (or create) /ssot/staging and /ssot/archive under FOLDER_ID.
+# ======= Three-folder lifecycle config (baseline retained) =======
 def _ensure_subfolder(parent_id: str, name: str) -> str:
     q = (
         f"'{parent_id}' in parents and "
@@ -89,24 +95,85 @@ def _resolve_parents_arg(parents_arg):
     elif isinstance(parents_arg, list) and parents_arg:
         pid = _map_token(parents_arg[0])
     else:
-        abort(400, description="invalid 'parents' argument")
+        return abort(400, description="invalid 'parents' argument")
 
     if not pid:
-        abort(500, description="parent folder could not be resolved")
+        return abort(500, description="parent folder could not be resolved")
     return [pid]
 
 def _enforce_allowed_parents(parents):
     if not parents or parents[0] not in ALLOWED_PARENTS:
-        abort(403, description="Parent folder not allowed; must be /ssot, /ssot/staging, or /ssot/archive.")
+        return abort(403, description="Parent folder not allowed; must be /ssot, /ssot/staging, or /ssot/archive.")
 
 def _ensure_in_folder(file_id: str, folder_id: str, err="File is not in required folder"):
     meta = drive_service.files().get(
         fileId=file_id, fields="id,parents", supportsAllDrives=True
     ).execute()
     if folder_id not in (meta.get('parents') or []):
-        abort(403, description=err)
+        return abort(403, description=err)
 
-# ======= Helpers =======
+# ======= Staging "complete document" validator =======
+CONFLICT_MARKERS = ('<<<<<<<', '=======', '>>>>>>>')
+PATCH_MARKERS_RE = re.compile(r'^(diff --git|Index: |\*\*\* |--- [ab]/|\+\+\+ [ab]/|@@ )', re.MULTILINE)
+
+def _ext(name): return os.path.splitext(name or '')[1].lower()
+def _is_texty(mime, name):
+    ext = _ext(name)
+    return (mime or '').startswith('text/') or (mime in {'application/x-yaml','text/yaml','application/json'}) or (ext in {'.yml','.yaml','.md','.markdown','.json','.csv','.txt'})
+
+def _looks_like_patch_or_diff(text: str) -> bool:
+    if not text:
+        return True
+    if PATCH_MARKERS_RE.search(text):
+        return True
+    if any(m in text for m in CONFLICT_MARKERS):
+        return True
+    # heavy +/- lines typical of patches (exclude YAML/MD lists "- ")
+    lines = [ln for ln in text.splitlines()[:200]]
+    plus_minus = sum(1 for ln in lines if (ln.startswith('+') or (ln.startswith('-') and not ln.startswith('- '))))
+    return (plus_minus >= max(5, int(0.3 * (len(lines) or 1))))
+
+def _validate_full_document_for_staging(name: str, mime: str, content_bytes: bytes):
+    # 1) Must be non-empty
+    if not content_bytes or len(content_bytes) == 0:
+        return abort(422, description="stagingRequiresFullDocument: empty content not allowed")
+    # 2) Only validate text-like formats
+    if not _is_texty(mime, name):
+        # Allow binary like .docx without deep validation
+        return
+    try:
+        text = content_bytes.decode('utf-8', errors='replace')
+    except Exception:
+        return abort(422, description="stagingRequiresFullDocument: content must be UTF-8 text for text formats")
+
+    # 3) Block obvious diffs/patches/merge fragments
+    if _looks_like_patch_or_diff(text):
+        return abort(422, description="stagingRequiresFullDocument: detected diff/patch/fragment; submit a full file")
+
+    ext = _ext(name)
+
+    # 4) Light structural checks per type
+    if ext in ('.yml', '.yaml'):
+        if HAVE_YAML:
+            try:
+                parsed = yaml.safe_load(text)
+            except Exception:
+                return abort(422, description="stagingRequiresFullDocument: invalid YAML; submit well-formed YAML")
+            if parsed is None:
+                return abort(422, description="stagingRequiresFullDocument: YAML is empty; submit complete document")
+        # if PyYAML not available, we already passed text/diff checks
+    elif ext == '.json':
+        try:
+            json.loads(text)
+        except Exception:
+            return abort(422, description="stagingRequiresFullDocument: invalid JSON; submit full JSON document")
+    elif ext == '.csv':
+        # very light CSV heuristic: at least 2 lines or one line with delimiter
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines or (len(lines) == 1 and (',' not in lines[0] and '\t' not in lines[0])):
+            return abort(422, description="stagingRequiresFullDocument: CSV appears incomplete; submit full table")
+
+# ======= Helpers (auth, mime, staging/archive/overwrite) — baseline retained and extended :contentReference[oaicite:3]{index=3}
 def require_api_key(write=False):
     def decorator(fn):
         @wraps(fn)
@@ -154,10 +221,10 @@ def ensure_in_ssot(file_id: str):
             fileId=file_id, fields="id, parents", supportsAllDrives=True
         ).execute()
     except Exception:
-        abort(404, description="File not found")
+        return abort(404, description="File not found")
     parents = meta.get('parents') or []
     if FOLDER_ID not in parents:
-        abort(403, description="File is not inside the SSOT folder")
+        return abort(403, description="File is not inside the SSOT folder")
 
 def text_upload_media(content: str, mime: str):
     b = (content or '').encode('utf-8')
@@ -172,7 +239,6 @@ def _archive_stamp():
     return datetime.utcnow().strftime('%Y-%m-%d-%H%M')
 
 def _download_bytes(file_id: str) -> bytes:
-    """Download a Drive file's bytes (full content fidelity)."""
     req = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, req)
@@ -181,7 +247,7 @@ def _download_bytes(file_id: str) -> bytes:
         _, done = downloader.next_chunk()
     return buf.getvalue()
 
-# ======= Lifecycle helpers: stage → archive → overwrite/promote =======
+# ======= Lifecycle helpers: stage → archive → overwrite/promote (baseline pattern) :contentReference[oaicite:4]{index=4}
 def stage_file(source_name: str, media_body):
     """Create *.proposed.<timestamp> in /ssot/staging/"""
     proposed_name = f"{source_name}.proposed.{now_stamp()}"
@@ -211,7 +277,6 @@ def archive_file(file_id: str) -> dict:
     return archived
 
 def _find_staged_for(meta_name: str):
-    """Find newest staged *.proposed.* for meta_name in /ssot/staging."""
     q = (
         f"'{STAGING_FOLDER_ID}' in parents and trashed = false and "
         f"mimeType != 'application/vnd.google-apps.folder' and "
@@ -227,45 +292,33 @@ def _find_staged_for(meta_name: str):
     return max(files, key=lambda f: f.get('modifiedTime', ''))
 
 def overwrite_file(file_id: str, media_body, new_name: str = None, staged_id: str = None):
-    """
-    Back-compat path: archive current, then overwrite authoritative with provided media bytes.
-    If staged_id is given, just ensure it's in /ssot/staging (filename no longer required to match).
-    """
+    """Archive current, then overwrite authoritative with provided media bytes (back-compat overwrite)."""
     _ensure_in_folder(file_id, FOLDER_ID, err="Target is not in /ssot (authoritative)")
     if staged_id:
         _ensure_in_folder(staged_id, STAGING_FOLDER_ID, err="stagedId is not in /ssot/staging")
-
-    # Explicit archive
     archived = archive_file(file_id)
     if not archived or not archived.get('id'):
-        abort(500, description="Archiving failed; aborting overwrite")
-
-    # Overwrite (optionally rename)
+        return abort(500, description="Archiving failed; aborting overwrite")
     body = {'name': new_name} if new_name else None
     updated = drive_service.files().update(
-        fileId=file_id,
-        body=body,
-        media_body=media_body,
+        fileId=file_id, body=body, media_body=media_body,
         fields="id,name,mimeType,parents,modifiedTime,size",
         supportsAllDrives=True
     ).execute()
-
     app.logger.info(f"[overwrite] updated {updated.get('name')} ({updated.get('id')}); archived {archived.get('name')}")
     return {"updated": updated, "archived": archived}
 
 def promote_staged_to_authoritative(authoritative_id: str, staged_id: str) -> dict:
     """
-    New explicit, verifiable workflow:
-      1) Archive the current authoritative file to /ssot/archive with timestamped name.
-      2) Promote staged content into authoritative by replacing its bytes (ID and name preserved).
-      3) Keep the staged file in /ssot/staging (for audit) — no deletes/moves.
-    Returns structured metadata for archived, staged, and updated authoritative.
+    Explicit workflow:
+      1) Archive the current authoritative file to /ssot/archive (timestamped).
+      2) Replace authoritative bytes with the staged file's bytes (name/ID preserved).
+      3) Keep the staged file for audit.
+      4) (New) Validate staged bytes are a complete document before promotion.
     """
-    # Folder checks
     _ensure_in_folder(authoritative_id, FOLDER_ID, err="authoritativeId must be inside /ssot")
     _ensure_in_folder(staged_id, STAGING_FOLDER_ID, err="stagedId must be inside /ssot/staging")
 
-    # Get metas (for names)
     auth_meta = drive_service.files().get(
         fileId=authoritative_id, fields="id,name,parents,mimeType,modifiedTime,size", supportsAllDrives=True
     ).execute()
@@ -273,22 +326,20 @@ def promote_staged_to_authoritative(authoritative_id: str, staged_id: str) -> di
         fileId=staged_id, fields="id,name,parents,mimeType,modifiedTime,size", supportsAllDrives=True
     ).execute()
 
-    # 1) Archive authoritative
-    archived = archive_file(authoritative_id)
-
-    # 2) Download staged bytes (full fidelity) and write to authoritative
+    # Validate staged file is a complete document
     staged_bytes = _download_bytes(staged_id)
-    media = MediaIoBaseUpload(io.BytesIO(staged_bytes), mimetype=staged_meta.get('mimeType') or 'application/octet-stream', resumable=False)
+    _validate_full_document_for_staging(staged_meta.get('name') or '', staged_meta.get('mimeType') or '', staged_bytes)
 
+    archived = archive_file(authoritative_id)
+    media = MediaIoBaseUpload(io.BytesIO(staged_bytes),
+                              mimetype=staged_meta.get('mimeType') or 'application/octet-stream',
+                              resumable=False)
     updated = drive_service.files().update(
-        fileId=authoritative_id,
-        body=None,  # keep same name
-        media_body=media,
+        fileId=authoritative_id, body=None, media_body=media,
         fields="id,name,mimeType,parents,modifiedTime,size",
         supportsAllDrives=True
     ).execute()
 
-    # Log clear action transcript
     app.logger.info(f"[promote] archived {auth_meta.get('name')} -> {archived.get('name')}; "
                     f"promoted content from staged {staged_meta.get('name')} into {updated.get('name')}")
 
@@ -300,7 +351,12 @@ def promote_staged_to_authoritative(authoritative_id: str, staged_id: str) -> di
         "authoritativeAfter": updated
     }
 
-# ======= Routes =======
+# ======= Error -> JSON for 422 =======
+@app.errorhandler(422)
+def handle_422(e):
+    return jsonify({"error": getattr(e, "description", "Unprocessable Entity")}), 422
+
+# ======= Routes (baseline retained, with staging validation added where applicable) =======
 @app.route('/', methods=['GET'])
 def index():
     return "GDrive SSOT API is running. Try /healthz and /files", 200
@@ -327,7 +383,6 @@ def healthz():
 @app.route('/files', methods=['GET'])
 @require_api_key(write=False)
 def list_files():
-    """List direct children of the SSOT folder (/ssot)."""
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents AND trashed = false",
@@ -342,7 +397,6 @@ def list_files():
 @app.route('/files/<file_id>/content', methods=['GET'])
 @require_api_key(write=False)
 def get_file_content(file_id):
-    """Raw bytes (octet-stream)."""
     try:
         req = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
         fh = io.BytesIO()
@@ -358,7 +412,6 @@ def get_file_content(file_id):
 @app.route('/files/<file_id>/text', methods=['GET'])
 @require_api_key(write=False)
 def get_file_text(file_id):
-    """Return UTF-8 text for text-like files (best effort)."""
     try:
         meta = drive_service.files().get(
             fileId=file_id, fields="id,name,mimeType", supportsAllDrives=True
@@ -380,24 +433,29 @@ def get_file_text(file_id):
 def upload_file():
     """
     Upload a new file into /ssot, /ssot/staging, or /ssot/archive.
-    multipart/form-data:
-      - file (binary, required)
-      - name (optional)
-      - parents (optional; 'ssot'|'staging'|'archive' or folderId; defaults to /ssot)
-      - confirm (required via guard)
+    Enforces 'full document' policy when parents resolves to /ssot/staging.
     """
     try:
         if 'file' not in request.files:
             return jsonify({"error": "missing 'file'"}), 400
         up = request.files['file']
+        raw = up.read()  # bytes for validation & upload
         name = request.form.get('name') or (up.filename or 'untitled')
-        if not allowed_name_and_mime(name, up.mimetype):
+        mime = up.mimetype or guess_mime_from_name(name)
+
+        if not allowed_name_and_mime(name, mime):
             return jsonify({"error": "file type not allowed"}), 415
+        if len(raw) > MAX_BYTES:
+            return jsonify({"error": "content exceeds MAX_BYTES"}), 413
 
         parents = _resolve_parents_arg(request.form.getlist('parents') or request.form.get('parents'))
         _enforce_allowed_parents(parents)
 
-        media = MediaIoBaseUpload(up.stream, mimetype=(up.mimetype or guess_mime_from_name(name)), resumable=False)
+        # Staging Policy: staging files must be complete docs
+        if parents[0] == STAGING_FOLDER_ID:
+            _validate_full_document_for_staging(name, mime, raw)
+
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
         created = drive_service.files().create(
             body={'name': name, 'parents': parents},
             media_body=media,
@@ -414,22 +472,16 @@ def upload_file():
 def update_file(file_id):
     """
     Replace contents of an existing authoritative file (binary).
-    multipart/form-data:
-      - file (binary, required)
-      - name (optional rename; must be allowed)
-      - mode (optional; 'staging' or 'overwrite') — defaults to WRITE_MODE
-      - stagedId (optional; used for overwrite compliance if you want to bind a specific staged file)
-      - confirm (required via guard)
-    Lifecycle rules:
-      - staging: write *.proposed.<ts> into /ssot/staging
-      - overwrite: archive current to /ssot/archive; then update /ssot (no filename coupling)
+    Staging mode writes *.proposed.<ts> into /ssot/staging and enforces full-document policy.
+    Overwrite mode archives current then updates authoritative.
     """
     try:
-        ensure_in_ssot(file_id)  # Target must be inside /ssot
+        ensure_in_ssot(file_id)
 
         if 'file' not in request.files:
             return jsonify({"error": "missing 'file'"}), 400
         up = request.files['file']
+        raw = up.read()
         new_name = request.form.get('name')
         mode = (request.form.get('mode') or WRITE_MODE).lower()
         staged_id = request.form.get('stagedId')
@@ -437,19 +489,21 @@ def update_file(file_id):
         meta = drive_service.files().get(
             fileId=file_id, fields="id,name,parents,mimeType", supportsAllDrives=True
         ).execute()
-
         target_name = new_name or meta['name']
-        target_mime = up.mimetype or guess_mime_from_name(target_name)
-        if not allowed_name_and_mime(target_name, target_mime):
-            return jsonify({"error": "file type not allowed"}), 415
+        mime = up.mimetype or guess_mime_from_name(target_name)
 
-        media = MediaIoBaseUpload(up.stream, mimetype=target_mime, resumable=False)
+        if not allowed_name_and_mime(target_name, mime):
+            return jsonify({"error": "file type not allowed"}), 415
+        if len(raw) > MAX_BYTES:
+            return jsonify({"error": "content exceeds MAX_BYTES"}), 413
+
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
 
         if mode == 'staging':
+            _validate_full_document_for_staging(target_name, mime, raw)
             created = stage_file(meta['name'], media)
             return jsonify({"mode": "staging", "created": created, "sourceId": file_id}), 201
 
-        # overwrite with explicit archive
         result = overwrite_file(file_id, media, new_name, staged_id)
         return jsonify({"mode": "overwrite", **result}), 200
 
@@ -462,12 +516,7 @@ def update_file(file_id):
 def create_text_file():
     """
     Create a new text-like file from JSON.
-    JSON body:
-      - name (required)
-      - content (required, UTF-8)
-      - mimeType (optional; default text/plain)
-      - parents (optional; 'ssot'|'staging'|'archive' or folderId; defaults to /ssot)
-      - confirm (required via guard)
+    If parents resolves to /ssot/staging, enforces 'full document' staging policy.
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -479,13 +528,17 @@ def create_text_file():
             return jsonify({"error": "missing 'name' or 'content'"}), 400
         if not allowed_name_and_mime(name, mime):
             return jsonify({"error": "file type not allowed"}), 415
-        if len((content or '').encode('utf-8')) > MAX_BYTES:
+        raw = (content or '').encode('utf-8')
+        if len(raw) > MAX_BYTES:
             return jsonify({"error": "content exceeds MAX_BYTES"}), 413
 
         parents = _resolve_parents_arg(parents_arg)
         _enforce_allowed_parents(parents)
 
-        media = text_upload_media(content, mime)
+        if parents[0] == STAGING_FOLDER_ID:
+            _validate_full_document_for_staging(name, mime, raw)
+
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
         created = drive_service.files().create(
             body={'name': name, 'parents': parents},
             media_body=media,
@@ -502,13 +555,7 @@ def create_text_file():
 def update_text_file(file_id):
     """
     Update an existing authoritative file from JSON text content.
-    JSON body:
-      - content (required)
-      - mimeType (optional; default text/plain)
-      - name (optional rename; applied only at overwrite)
-      - mode (optional; 'staging'|'overwrite') — defaults to WRITE_MODE
-      - stagedId (optional; used for overwrite compliance if binding to a specific staged item)
-      - confirm (required via guard)
+    In staging mode, enforces 'full document' policy before creating a *.proposed.<ts>.
     """
     try:
         ensure_in_ssot(file_id)
@@ -522,7 +569,8 @@ def update_text_file(file_id):
 
         if content is None:
             return jsonify({"error": "missing 'content'"}), 400
-        if len((content or '').encode('utf-8')) > MAX_BYTES:
+        raw = (content or '').encode('utf-8')
+        if len(raw) > MAX_BYTES:
             return jsonify({"error": "content exceeds MAX_BYTES"}), 413
 
         meta = drive_service.files().get(
@@ -533,9 +581,10 @@ def update_text_file(file_id):
         if not allowed_name_and_mime(target_name, mime):
             return jsonify({"error": "file type not allowed"}), 415
 
-        media = text_upload_media(content, mime)
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
 
         if mode == 'staging':
+            _validate_full_document_for_staging(target_name, mime, raw)
             created = stage_file(meta['name'], media)
             return jsonify({"mode": "staging", "created": created, "sourceId": file_id}), 201
 
@@ -549,7 +598,6 @@ def update_text_file(file_id):
 @app.route('/files/<file_id>/metadata', methods=['PATCH'])
 @require_api_key(write=True)
 def rename_file(file_id):
-    """Rename without changing content (authoritative only)."""
     try:
         ensure_in_ssot(file_id)
         data = request.get_json(silent=True) or {}
@@ -592,17 +640,13 @@ def cleanup_staging():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---- PROMOTE (explicit archive → promote) ----
+# ---- PROMOTE (archive → promote) ----
 @app.route('/promote', methods=['POST'])
 @require_api_key(write=True)
 def promote():
     """
     Promote a staged SSOT file into authoritative with explicit archival.
-    JSON body:
-      - authoritativeId (required): fileId of the authoritative file in /ssot
-      - stagedId (required): fileId of the staged file in /ssot/staging
-      - confirm (required via guard)
-    Returns: structured metadata (archived, staged, authoritativeBefore/After, actions)
+    Also validates the staged file is a full document before promotion.
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -631,5 +675,4 @@ def debug_folder():
         return {"error": str(e)}, 500
 
 if __name__ == '__main__':
-    # Render usually honors port 8080, but this also works if PORT is provided.
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')))
