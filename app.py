@@ -16,8 +16,9 @@ except Exception:
 app = Flask(__name__)
 
 # ======= SSOT CONFIG (Shared Drive) =======
-# Default to known SSOT folder; allow override via env.
 FOLDER_ID = os.getenv('FOLDER_ID') or '1Ox7DXcd9AEvF84FkCVyB90MGHR0v7q7R'  # /ssot (authoritative)
+if not FOLDER_ID:
+    raise RuntimeError("FOLDER_ID env var is required (Google Drive folder id for /ssot)")
 
 # ======= Google Drive API =======
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -27,7 +28,7 @@ credentials = service_account.Credentials.from_service_account_file(
 )
 drive_service = build('drive', 'v3', credentials=credentials)
 
-# ======= Guardrails / Ops Controls (Render → Environment) =======
+# ======= Guardrails / Ops Controls =======
 API_KEY = os.getenv('API_KEY')  # required for all routes
 READ_ONLY = os.getenv('READ_ONLY', 'true').lower() == 'true'
 WRITE_CONFIRM_PHRASE = os.getenv('WRITE_CONFIRM_PHRASE')
@@ -107,6 +108,49 @@ def _download_bytes(file_id: str) -> bytes:
 def _md5_hex(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
+# ======= Param normalization (fix for parents query regression) =======
+def _coerce_parents_param(param):
+    """
+    Accepts:
+      - None
+      - 'ssot' | 'staging' | 'archive' | <folderId>
+      - ['ssot'] | ['<folderId>'] (true array)
+      - '["ssot"]' | '["<folderId>"]' (JSON array encoded as string)
+      - Repeated query params (?parents=ssot&parents=staging) -> first wins
+    Returns a string or list[str] suitable for _resolve_parents_arg.
+    """
+    if param is None:
+        return None
+    # If Flask gave us a list from getlist(...)
+    if isinstance(param, list):
+        if not param:
+            return None
+        # If first element itself is a JSON array in a string, parse it
+        first = param[0]
+        if isinstance(first, str):
+            s = first.strip()
+            if s.startswith('[') and s.endswith(']'):
+                try:
+                    arr = json.loads(s)
+                    if isinstance(arr, list) and arr:
+                        return arr
+                except Exception:
+                    pass
+        return param  # already a list (use first element downstream)
+    # If Flask gave us a single string
+    if isinstance(param, str):
+        s = param.strip()
+        if s.startswith('[') and s.endswith(']'):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list) and arr:
+                    return arr
+            except Exception:
+                pass
+        return s
+    # Fallback: leave as-is
+    return param
+
 # ======= Parent resolution & folder guards =======
 def _resolve_parents_arg(parents_arg):
     """
@@ -184,7 +228,7 @@ def _validate_full_document_for_staging(name: str, mime: str, content_bytes: byt
     if not content_bytes or len(content_bytes) == 0:
         abort(422, description="stagingRequiresFullDocument: empty content not allowed")
     if not _is_texty(mime, name):
-        return  # allow binary like .docx without deep validation
+        return
     try:
         text = content_bytes.decode('utf-8', errors='replace')
     except Exception:
@@ -283,7 +327,6 @@ def _find_staged_for(meta_name: str):
     return max(files, key=lambda f: f.get('modifiedTime', ''))
 
 def _update_bytes_with_mime(file_id: str, content_bytes: bytes, name_for_mime: str, prefer_mime=None):
-    # Always enforce canonical MIME for target name
     mime = canonical_mime_for(name_for_mime, prefer_mime)
     media = MediaIoBaseUpload(io.BytesIO(content_bytes), mimetype=mime, resumable=False)
     updated = drive_service.files().update(
@@ -411,7 +454,7 @@ def healthz():
             "stagingFolderId": STAGING_FOLDER_ID,
             "archiveFolderId": ARCHIVE_FOLDER_ID,
             "driveId": drive_id,
-            "aliases": {  # cacheable by GPT
+            "aliases": {
                 "ssot": FOLDER_ID,
                 "staging": STAGING_FOLDER_ID,
                 "archive": ARCHIVE_FOLDER_ID
@@ -420,7 +463,7 @@ def healthz():
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
 
-# ---- LIST (alias-aware) ----
+# ---- LIST (alias-aware; robust param normalization) ----
 @app.route('/files', methods=['GET'])
 @require_api_key(write=False)
 def list_files():
@@ -428,10 +471,12 @@ def list_files():
     List direct children of a folder.
     Query:
       - parents (optional): "ssot" | "staging" | "archive" | <folderId>
-        May also be ["ssot"]. Defaults to /ssot.
+        Also accepts JSON array string '["ssot"]' or repeated params; defaults to /ssot.
     """
     try:
-        parents_arg = request.args.getlist('parents') or request.args.get('parents')
+        raw_param = request.args.getlist('parents')
+        raw_param = raw_param if raw_param else request.args.get('parents')
+        parents_arg = _coerce_parents_param(raw_param)  # <-- fix: normalize all representations
         folder_id = _resolve_parents_arg(parents_arg)[0] if parents_arg else FOLDER_ID
 
         drive_id = _get_drive_id(folder_id)
@@ -446,7 +491,8 @@ def list_files():
         ).execute()
         return jsonify(results.get('files', [])), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Make it explicit for debugging callers
+        return jsonify({"error": str(e), "hint": "Check parents param format: use ssot|staging|archive or a folderId, or JSON array like [\"ssot\"]"}), 500
 
 # ---- READ: bytes + text ----
 @app.route('/files/<file_id>/content', methods=['GET'])
@@ -503,7 +549,8 @@ def upload_file():
         if len(raw) > MAX_BYTES:
             return jsonify({"error": "content exceeds MAX_BYTES"}), 413
 
-        parents = _resolve_parents_arg(request.form.getlist('parents') or request.form.get('parents'))
+        parents_raw = request.form.getlist('parents') or request.form.get('parents')
+        parents = _resolve_parents_arg(_coerce_parents_param(parents_raw))
         _enforce_allowed_parents(parents)
 
         if parents[0] == STAGING_FOLDER_ID:
@@ -588,7 +635,7 @@ def create_text_file():
         if len(raw) > MAX_BYTES:
             return jsonify({"error": "content exceeds MAX_BYTES"}), 413
 
-        parents = _resolve_parents_arg(parents_arg)
+        parents = _resolve_parents_arg(_coerce_parents_param(parents_arg))
         _enforce_allowed_parents(parents)
 
         if parents[0] == STAGING_FOLDER_ID:
